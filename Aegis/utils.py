@@ -21,9 +21,9 @@ def show_comparison(original_path, cloaked_image):
         ax[1].axis('off')
         plt.show()
 
-def save_image(image, folder_path="assets/generatedImages/"):
+def save_image(image,folder_path="GeneratedImages/"):
 
-    filename = f"{int(1e7*(time.time()-int(time.time())))}.png"
+    filename = f"Aegis{int(1e7*(time.time()-int(time.time())))}.png"
     
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)

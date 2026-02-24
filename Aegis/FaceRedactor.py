@@ -43,24 +43,64 @@ class FaceRedactor:
         plt.show()
 
     def apply_redaction(self, image, boxes, indices_to_blur):
-        """Applies Gaussian blur to selected bounding boxes."""
+        """Applies blur with padding to avoid hard square edges."""
         final_img = image.copy()
+        img_h, img_w = final_img.shape[:2]  # Get image dimensions
+        
         for idx in indices_to_blur:
             if 0 <= idx < len(boxes):
                 x, y, w, h = boxes[idx]
-                x, y = max(0, x), max(0, y)
                 
-                roi = final_img[y:y+h, x:x+w]
+                #  Add Padding
+                # We expand the box by ~20% on all sides
+                pad_w = int(w * 0.2)
+                pad_h = int(h * 0.2)
+                
+                # Calculate new expanded coordinates, keeping them within image bounds
+                x_new = max(0, x - pad_w)
+                y_new = max(0, y - pad_h)
+                w_new = min(img_w - x_new, w + 2 * pad_w)
+                h_new = min(img_h - y_new, h + 2 * pad_h)
+                
+                # Extract the larger ROI
+                roi = final_img[y_new:y_new+h_new, x_new:x_new+w_new]
+                
                 if roi.size > 0:
-                    # Adaptive kernel size: roughly half the face width, must be odd
-                    ksize = (int(w//2) | 1, int(h//2) | 1)
-                    ksize = (max(31, ksize[0]), max(31, ksize[1]))
+                    # Adaptive kernel relative to the NEW size
+                    ksize = (int(w_new) | 1, int(h_new) | 1)
+                    ksize = (max(51, ksize[0]), max(51, ksize[1]))
                     
-                    blurred_roi = cv2.GaussianBlur(roi, ksize, 30)
-                    final_img[y:y+h, x:x+w] = blurred_roi
-            else:
-                print(f"Warning: ID {idx} is out of range.")
+                    blurred_roi = cv2.GaussianBlur(roi, ksize, 75)
+
+                    # blurred_roi = cv2.GaussianBlur(blurred_roi, ksize, 75)
+                    
+                    # Create mask for the larger ROI
+                    mask = np.zeros((h_new, w_new), dtype=np.uint8)
+                    
+                    # Draw ellipse: Keep it slightly smaller than the full padded box
+                    # so the fade-out happens entirely inside the ROI
+                    center = (w_new // 2, h_new // 2)
+                    axes = (int(w * 0.5), int(h * 0.5)) # Use ORIGINAL w/h for ellipse size
+                    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+                    
+                    # Heavy feathering for the soft edge
+                    feather_ksize = (int(w_new//3) | 1, int(h_new//3) | 1) 
+                    mask = cv2.GaussianBlur(mask, feather_ksize, 0)
+                    
+                    # Alpha Blending
+                    mask_3d = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                    alpha = mask_3d.astype(float) / 255.0
+                    
+                    roi_float = roi.astype(float)
+                    blurred_float = blurred_roi.astype(float)
+                    
+                    blended_roi = (blurred_float * alpha) + (roi_float * (1.0 - alpha))
+                    
+                    # Place the larger blended ROI back into the image
+                    final_img[y_new:y_new+h_new, x_new:x_new+w_new] = blended_roi.astype(np.uint8)
+                    
         return final_img
+
 
 
 

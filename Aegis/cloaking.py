@@ -1,28 +1,27 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torchvision import models, transforms
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
 import os
+import random
+from pytorch_msssim import ssim 
 import time
 
 class AegisCloakingEngine:
     def __init__(self, target_pool_path=None):
-        """
-        Implementation of the Fawkes Image Cloaking System.
-        
+        """        
         Args:
             target_pool_path: Path to a directory containing images of other people. 
-                              Used to find the 'most dissimilar'
+                              Used to find highly dissimilar targets.
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"--- Aegis Cloaking Engine Initialized on {self.device} ---")
 
         # 1. Feature Extractor
-        # use ResNet50 as a standard robust proxy.
         resnet = models.resnet50(pretrained=True).to(self.device)
         self.feature_extractor = nn.Sequential(*list(resnet.children())[:-1]).eval()
         
@@ -30,154 +29,160 @@ class AegisCloakingEngine:
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
 
-        # 2. Preprocessing 
-        self.preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        # 2. Preprocessing (Decoupled for Resolution Preservation)
+        # Converts PIL image to [0, 1] tensor without resizing
+        self.to_tensor = transforms.ToTensor()
         
-        # Inverse transform for visualization/saving
-        self.denormalize = transforms.Compose([
-            transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225], 
-                                 std=[1/0.229, 1/0.224, 1/0.225]),
-        ])
+        # Normalization specific to the ResNet50 model expectations
+        self.normalize_for_model = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
 
         self.target_pool_path = target_pool_path
 
     def load_image_as_tensor(self, path):
-        """Loads image and normalizes it for the model."""
+        """Loads image in its original resolution as a [0, 1] tensor."""
         img = Image.open(path).convert('RGB')
-        return self.preprocess(img).unsqueeze(0).to(self.device)
+        tensor_img = self.to_tensor(img).unsqueeze(0).to(self.device)
+        return tensor_img
 
-    def select_optimal_target(self, user_features):
+    def get_features(self, img_tensor):
+        """Helper to resize, normalize, and extract features for any sized tensor."""
+        # Interpolate dynamically resizes the tensor while keeping the operation differentiable
+        resized = F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+        normalized = self.normalize_for_model(resized)
+        return self.feature_extractor(normalized)
+
+    def select_optimal_target(self, user_features, top_k=10):
         """
-        Step 1 : Choosing a Target Class
-        Scans the target_pool directory to find the face 'most dissimilar' 
-        to the user's face in feature space.
+        Custom Target Selection:
+        Calculates L2 distance for all images, takes the top K most dissimilar,
+        and randomly selects one from that pool.
         """
         if not self.target_pool_path or not os.path.exists(self.target_pool_path):
             print("No target pool provided. Using random noise target (High Privacy).")
             return None
 
-        print("Searching for optimal target identity...")
-        max_dist = -1.0
-        best_target_path = None
-        
+        print("Scanning target pool for highly dissimilar identities...")
+        distances = []
         valid_exts = ('.jpg', '.jpeg', '.png')
+        
         for filename in os.listdir(self.target_pool_path):
             if not filename.lower().endswith(valid_exts):
                 continue
                 
             path = os.path.join(self.target_pool_path, filename)
             try:
-                # Load candidate target
+                # Load candidate target and extract features
                 t_tensor = self.load_image_as_tensor(path)
                 with torch.no_grad():
-                    t_features = self.feature_extractor(t_tensor)
+                    t_features = self.get_features(t_tensor)
                 
-                # Calculate L2 distance [cite: 258]
+                # Calculate L2 distance
                 dist = torch.dist(user_features, t_features).item()
-                
-                if dist > max_dist:
-                    max_dist = dist
-                    best_target_path = path
+                distances.append((dist, path))
             except Exception as e:
                 continue
         
-        if best_target_path:
-            print(f"Target Selected: {os.path.basename(best_target_path)} (Distance: {max_dist:.4f})")
+        if not distances:
+            return None
+
+        # Sort by distance descending (most dissimilar at index 0)
+        distances.sort(key=lambda x: x[0], reverse=True)
+        
+        # Determine how many candidates make up the "top pool"
+        pool_size = min(top_k, len(distances))
+        top_candidates = distances[:pool_size]
+        
+        # Randomly select one target from the top dissimilar pool
+        chosen_dist, best_target_path = random.choice(top_candidates)
+        
+        print(f"Target Selected: {os.path.basename(best_target_path)} (Distance: {chosen_dist:.4f})")
         return best_target_path
 
-    def generate_cloak(self, input_path, manual_target_path=None, iterations=1000, lr=0.005, epsilon=0.05):
+    # --- Tanh Space Transformations  ---
+    def to_tanh_space(self, x, eps=1e-6):
+        """Maps an image from [0, 1] to unbounded tanh space."""
+        x = torch.clamp(x, eps, 1.0 - eps)
+        x = (x - 0.5) * 2.0
+        return torch.atanh(x)
+
+    def from_tanh_space(self, w):
+        """Maps unbounded tanh space back to [0, 1] image space."""
+        return (torch.tanh(w) + 1.0) / 2.0
+
+    def generate_cloak(self, input_path, manual_target_path=None, iterations=1000, lr=0.5, rho=0.007, penalty_lambda=15000.0):
         """
-        Step 2: Computing Per-image Cloaks[cite: 259].
-        
-        Args:
-            iterations: Paper suggests 1000 iterations.
-            epsilon: Budget for pixel change (e.g. 0.03-0.07).
-            
-        Returns:
-            BGR numpy array ready for cv2.imwrite.
+        Step 2: Computing Per-image Cloaks (Full Resolution + Paper Specs)
         """
-        # A. Load Original Image
-        original_tensor = self.load_image_as_tensor(input_path)
+        # A. Load Original Image (Full Resolution)
+        original_tensor = self.load_image_as_tensor(input_path) 
         
-        # B. Extract User Features
+        # B. Extract User Features (Dynamically Resized inside get_features)
         with torch.no_grad():
-            user_features = self.feature_extractor(original_tensor)
+            user_features = self.get_features(original_tensor)
 
         # C. Determine Target Features
         target_path = manual_target_path
-        
-        # If no manual target, find the best one automatically
         if not target_path:
             target_path = self.select_optimal_target(user_features)
             
         if target_path:
             target_tensor = self.load_image_as_tensor(target_path)
             with torch.no_grad():
-                target_features = self.feature_extractor(target_tensor)
+                target_features = self.get_features(target_tensor)
         else:
-            # Fallback: Random features if no target images available
             target_features = torch.randn_like(user_features)
 
-        # D. Initialize Delta (The Cloak)
-        # We optimize 'delta', not the image itself.
-        delta = torch.zeros_like(original_tensor, requires_grad=True).to(self.device)
+        # D. Initialize Delta in Tanh Space 
+        # Convert original image to tanh space to ensure pixel bounds
+        w_orig = self.to_tanh_space(original_tensor).detach()
         
-        # E. Setup Optimizer
-        # Adam optimizer 
-        optimizer = optim.Adam([delta], lr=lr)
-        mse_loss = nn.MSELoss()
+        # We optimize delta in tanh space, at full original resolution!
+        delta_w = torch.zeros_like(w_orig, requires_grad=True).to(self.device)
+        
+        # E. Setup Optimizer (Paper uses lr=0.5 for Adam) [cite: 315]
+        optimizer = optim.Adam([delta_w], lr=lr) 
 
-        print(f"Starting Cloaking Process ({iterations} iters)...")
+        print(f"Starting Cloaking Process ({iterations} iters, DSSIM budget {rho})...")
         
         for i in range(iterations):
             optimizer.zero_grad()
             
-            # 1. Apply Delta to Image
-            # Clamp delta to epsilon immediately to ensure constraints during forward pass
-            clamped_delta = torch.clamp(delta, -epsilon, epsilon)
-            cloaked_input = original_tensor + clamped_delta
+            # 1. Apply delta and map back to [0, 1] image space 
+            cloaked_input = self.from_tanh_space(w_orig + delta_w)
             
-            # 2. Extract Features of Cloaked Image
-            current_features = self.feature_extractor(cloaked_input)
+            # 2. Extract Features 
+            # (Interpolates down to 224x224 smoothly so gradients flow back to full-res delta)
+            current_features = self.get_features(cloaked_input)
             
-            # 3. Loss: Minimize distance to TARGET features 
-            # We want the face to look like the Target, not the User.
-            loss = mse_loss(current_features, target_features)
+            # 3. Feature Loss: Minimize L2 distance to Target features 
+            feature_loss = torch.dist(current_features, target_features, p=2)
+            
+            # 4. DSSIM Penalty Method 
+            current_ssim = ssim(cloaked_input, original_tensor, data_range=1.0, size_average=True)
+            current_dssim = (1.0 - current_ssim) / 2.0
+            
+            # Penalty activates only if DSSIM exceeds our budget rho 
+            dssim_penalty = torch.clamp(current_dssim - rho, min=0.0)
+            
+            # Total Loss combining feature displacement and visual fidelity constraint 
+            loss = feature_loss + (penalty_lambda * dssim_penalty)
             
             loss.backward()
             optimizer.step()
             
-            # 4. Project Delta (Constraint)
-            # Ensure delta stays within valid epsilon range after update
-            with torch.no_grad():
-                delta.data = torch.clamp(delta.data, -epsilon, epsilon)
-            
             if i % 100 == 0:
-                print(f"Step {i}/{iterations} | Loss: {loss.item():.6f}")
+                print(f"Step {i}/{iterations} | Loss: {loss.item():.4f} | DSSIM: {current_dssim.item():.5f}")
 
-        # F. Generate Final Image
+        # F. Generate Final High-Res Image
         with torch.no_grad():
-            # Apply final optimized delta
-            final_delta = torch.clamp(delta, -epsilon, epsilon)
-            final_tensor = original_tensor + final_delta
+            final_tensor = self.from_tanh_space(w_orig + delta_w)
+            final_tensor = torch.clamp(final_tensor.squeeze(0), 0, 1)
             
-            # Denormalize back to [0,1] range for saving
-            # Remove batch dim -> (C, H, W)
-            final_tensor = self.denormalize(final_tensor.squeeze(0)) 
-            
-            # Clamp to ensure valid image range [0, 1]
-            final_tensor = torch.clamp(final_tensor, 0, 1)
-            
-            # Convert to Numpy (H, W, C)
             final_image = final_tensor.permute(1, 2, 0).cpu().numpy()
-            
-            # Convert RGB to BGR 
             final_image = (final_image * 255).astype(np.uint8)
             final_bgr = cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR)
             
             return final_bgr
-

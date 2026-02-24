@@ -6,5 +6,5 @@ ipykernel
 matplotlib
 ultralytics
 easyocr
-torch
+torchconda
 torchvision
